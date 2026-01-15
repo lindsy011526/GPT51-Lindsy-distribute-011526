@@ -97,6 +97,7 @@ UI_TEXT = {
         "agent_hq_edit_output": "可編輯輸出（作為下一個代理的輸入）",
         "agent_hq_use_as_next": "➡️ 將上方內容作為下一個代理輸入",
         "skills_header": "技能說明（來自 SKILL.md）",
+        "usage_log_tab": "📝 使用日誌",
     },
     "en": {
         "app_title": "🏥 GUDID Agentic AI — WOW Supply Chain Analytics",
@@ -148,6 +149,7 @@ UI_TEXT = {
         "agent_hq_edit_output": "Editable output (feed into next agent)",
         "agent_hq_use_as_next": "➡️ Use above content as next agent input",
         "skills_header": "Skills (from SKILL.md)",
+        "usage_log_tab": "📝 Usage Log",
     },
 }
 
@@ -252,7 +254,6 @@ PAINTER_STYLES = [
         "text_light": "#111827",
         "text_dark": "#e5e7eb",
     },
-    # 10 more simple variations to reach 20
     {
         "id": "cezanne",
         "name_en": "Cézanne — Landscapes",
@@ -453,8 +454,7 @@ def load_packing_list(csv_file) -> pd.DataFrame:
         text = csv_file.read().decode("utf-8")
     else:
         text = SAMPLE_CSV
-    # Clean full-width quotes that break parsing
-    text = text.replace("“", "").replace("”", "").replace("”", "").replace("“", "")
+    text = text.replace("“", "").replace("”", "")
     df = pd.read_csv(StringIO(text))
     if "deliverdate" in df.columns:
         df["deliverdate_dt"] = df["deliverdate"].apply(excel_serial_to_date)
@@ -463,41 +463,149 @@ def load_packing_list(csv_file) -> pd.DataFrame:
     return df
 
 
-def build_supply_chain_graph(df: pd.DataFrame):
+# =========================
+# SIMPLE USAGE LOG
+# =========================
+
+def log_event(event_type: str, detail: str):
+    """Append a simple usage log entry into session_state."""
+    ts = datetime.now().isoformat()
+    if "usage_log" not in st.session_state:
+        st.session_state.usage_log = []
+    st.session_state.usage_log.append(
+        {
+            "timestamp": ts,
+            "type": event_type,
+            "detail": detail,
+        }
+    )
+
+
+# =========================
+# SUPPLY CHAIN GRAPH BUILD & RENDER
+# =========================
+
+def build_supply_chain_graph(
+    df: pd.DataFrame,
+    license_id_filter: Optional[str] = None,
+    lot_filter: Optional[str] = None,
+    max_nodes: int = 200,
+    max_edges: int = 400,
+    search_term: Optional[str] = None,
+):
+    """Build a Network (pyvis) from packing list with filters and limits."""
     if nx is None or Network is None:
         return None
 
+    df_g = df.copy()
+
+    if license_id_filter:
+        df_g = df_g[df_g["licenseID"] == license_id_filter]
+
+    if lot_filter:
+        df_g = df_g[df_g["LotNumber"] == lot_filter]
+
     G = nx.DiGraph()
-    for _, row in df.iterrows():
-        supplier = str(row.get("Suppliername", ""))
-        device = str(row.get("DeviceName", ""))
-        customer = str(row.get("customer", ""))
+
+    search_lower = search_term.lower() if search_term else None
+
+    edge_count = 0
+    for _, row in df_g.iterrows():
+        supplier = str(row.get("Suppliername", "")).strip()
+        device = str(row.get("DeviceName", "")).strip()
+        customer = str(row.get("customer", "")).strip()
         qty = int(row.get("Numbers", 0))
 
+        if not supplier and not device and not customer:
+            continue
+
+        # Add nodes with type
         if supplier:
-            G.add_node(supplier, type="supplier")
+            if supplier not in G:
+                if G.number_of_nodes() >= max_nodes:
+                    continue
+                G.add_node(supplier, type="supplier")
         if device:
-            G.add_node(device, type="device")
+            if device not in G:
+                if G.number_of_nodes() >= max_nodes:
+                    continue
+                G.add_node(device, type="device")
         if customer:
-            G.add_node(customer, type="customer")
+            if customer not in G:
+                if G.number_of_nodes() >= max_nodes:
+                    continue
+                G.add_node(customer, type="customer")
 
+        # Highlight logic
+        def should_highlight(name: str) -> bool:
+            if not search_lower:
+                return False
+            return search_lower in name.lower()
+
+        if supplier and should_highlight(supplier):
+            G.nodes[supplier]["highlight"] = True
+        if device and should_highlight(device):
+            G.nodes[device]["highlight"] = True
+        if customer and should_highlight(customer):
+            G.nodes[customer]["highlight"] = True
+
+        # Add edges with limits
         if supplier and device:
-            G.add_edge(supplier, device, weight=qty)
-        if device and customer:
-            G.add_edge(device, customer, weight=qty)
+            if edge_count >= max_edges:
+                break
+            if not G.has_edge(supplier, device):
+                G.add_edge(supplier, device, weight=qty)
+                edge_count += 1
 
-    net = Network(height="500px", width="100%", directed=True, bgcolor="#0b1120", font_color="#e5e7eb")
+        if device and customer:
+            if edge_count >= max_edges:
+                break
+            if not G.has_edge(device, customer):
+                G.add_edge(device, customer, weight=qty)
+                edge_count += 1
+
+    log_event(
+        "graph_build",
+        f"nodes={G.number_of_nodes()}, edges={G.number_of_edges()}, "
+        f"license={license_id_filter or 'All'}, lot={lot_filter or 'All'}, "
+        f"search={search_term or ''}, max_nodes={max_nodes}, max_edges={max_edges}",
+    )
+
+    net = Network(height="100%", width="100%", directed=True, bgcolor="#0b1120", font_color="#e5e7eb")
     net.from_nx(G)
 
-    # Apply simple physics
-    net.force_atlas_2based()
+    # Apply node styling by type and highlight
+    for node in net.nodes:
+        n_type = node.get("type", "")
+        highlight = node.get("highlight", False)
+
+        if n_type == "supplier":
+            base_color = "#38bdf8"  # sky blue
+        elif n_type == "device":
+            base_color = "#22c55e"  # green
+        elif n_type == "customer":
+            base_color = "#f97316"  # orange
+        else:
+            base_color = "#e5e7eb"
+
+        if highlight:
+            node["color"] = {"background": "#facc15", "border": "#f97316"}
+            node["size"] = 28
+        else:
+            node["color"] = {"background": base_color, "border": "#e5e7eb"}
+            node["size"] = 18
+
+        node["shape"] = "dot"
+
     return net
 
 
-def render_supply_chain_graph(net: Optional[Network]):
+def render_supply_chain_graph(net: Optional[Network], height: int = 520):
+    """Render supply chain graph safely in Streamlit / Hugging Face Space."""
     if net is None:
         st.warning("networkx / pyvis not installed; graph view unavailable.")
         return
+
     net.set_options(
         """
         var options = {
@@ -518,10 +626,16 @@ def render_supply_chain_graph(net: Optional[Network]):
         }
         """
     )
-    net.show("supply_chain_graph.html")
-    with open("supply_chain_graph.html", "r", encoding="utf-8") as f:
-        html = f.read()
-    components.html(html, height=520, scrolling=True)
+
+    try:
+        html = net.generate_html(notebook=False)
+    except Exception:
+        tmp_path = "supply_chain_graph.html"
+        net.write_html(tmp_path, notebook=False)
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            html = f.read()
+
+    components.html(html, height=height, scrolling=True)
 
 
 # =========================
@@ -565,7 +679,6 @@ class Agent:
         effective_model = model_override or self.model
         effective_system = system_prompt_override or self.system_prompt
 
-        # If model override implies provider, respect that
         provider = self.llm_provider
         if model_override and model_override in MODEL_PROVIDER_MAP:
             provider = MODEL_PROVIDER_MAP[model_override]
@@ -607,7 +720,6 @@ class Agent:
             )
             return response.choices[0].message.content
         else:
-            # Legacy completion fallback
             completion = client.Completion.create(
                 model=model,
                 prompt=f"{system_prompt}\n\nUser: {query}\nAssistant:",
@@ -747,6 +859,7 @@ class AgentOrchestrator:
             "model": model_override or agent.model,
         }
         self.conversation_history.append(record)
+        log_event("agent_run", f"agent={agent_name}, model={record['model']}")
 
         return {
             "agent": agent_name,
@@ -820,7 +933,6 @@ def render_wow_status(orchestrator: AgentOrchestrator):
             unsafe_allow_html=True,
         )
 
-    # API health badges
     def provider_badge(name, env_var):
         ok = bool(os.getenv(env_var))
         color = "#22c55e" if ok else "#ef4444"
@@ -887,16 +999,27 @@ def render_agent_headquarters(orchestrator: AgentOrchestrator):
 
         st.markdown("---")
         st.subheader(tr("agent_hq_edit_output"))
-        editable = st.text_area(
-            "", value=output_text, height=220, key="editable_agent_output"
-        )
+        editable = st.text_area("", value=output_text, height=220, key="editable_agent_output")
         if st.button(tr("agent_hq_use_as_next")):
             st.session_state.agent_chain["current_input"] = editable
             st.success("Set as next agent input. Scroll up to adjust agent/model and run again.")
-###
+
+
 def render_supply_chain_analytics():
     st.subheader(tr("supply_chain_analytics"))
     uploaded = st.file_uploader(tr("upload_csv"), type=["csv"])
+
+    # Log upload vs sample usage
+    if uploaded is not None:
+        last_name = st.session_state.get("last_csv_name")
+        if uploaded.name != last_name:
+            log_event("csv_upload", f"filename={uploaded.name}")
+            st.session_state.last_csv_name = uploaded.name
+    else:
+        if not st.session_state.get("sample_csv_logged", False):
+            log_event("csv_sample_used", "Using built-in sample CSV")
+            st.session_state.sample_csv_logged = True
+
     df = load_packing_list(uploaded)
 
     if df.empty:
@@ -907,38 +1030,27 @@ def render_supply_chain_analytics():
     st.markdown("### Filters")
     col_f1, col_f2 = st.columns(2)
 
-    # ---- Customer filter ----
     with col_f1:
         if "customer" in df.columns:
             customers = sorted(df["customer"].dropna().unique().tolist())
             selected_customers = st.multiselect("Customer", options=customers, default=customers)
         else:
-            customers = []
             selected_customers = []
 
-    # ---- Date range filter: use Python datetime.date to avoid Streamlit type issues ----
     with col_f2:
         date_range = None
         if "deliverdate_dt" in df.columns and df["deliverdate_dt"].notna().any():
-            # 僅使用非 NaT 的列來計算範圍
             df_dates = df[df["deliverdate_dt"].notna()].copy()
-
-            # 轉成 Python datetime.date，避免 pandas.Timestamp / NaT 型別混用
             min_ts = df_dates["deliverdate_dt"].min()
             max_ts = df_dates["deliverdate_dt"].max()
-
-            # 保險起見先確定是 Timestamp 或 datetime，再取 .date()
             if isinstance(min_ts, pd.Timestamp):
                 min_d = min_ts.date()
             else:
                 min_d = min_ts
-
             if isinstance(max_ts, pd.Timestamp):
                 max_d = max_ts.date()
             else:
                 max_d = max_ts
-
-            # Slider 完全使用 datetime.date 型別
             date_range = st.slider(
                 "Deliver Date Range",
                 min_value=min_d,
@@ -946,15 +1058,13 @@ def render_supply_chain_analytics():
                 value=(min_d, max_d),
             )
 
-    # ---- Apply filters to DataFrame ----
-    # 初始全部 True
+    # Apply filters
     mask = pd.Series(True, index=df.index)
 
     if selected_customers:
         mask &= df["customer"].isin(selected_customers)
 
     if date_range and "deliverdate_dt" in df.columns:
-        # slider 回傳的是 datetime.date，將欄位轉為 date 後再 between
         start_date, end_date = date_range
         valid_dt = df["deliverdate_dt"].notna()
         mask &= valid_dt
@@ -985,6 +1095,15 @@ def render_supply_chain_analytics():
         ]
     )
     st.dataframe(summary_1, use_container_width=True)
+    # Download button for summary_1
+    csv_summary = summary_1.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "下載摘要表 CSV" if st.session_state.get("lang", "zh") == "zh" else "Download summary CSV",
+        data=csv_summary,
+        file_name="summary_overview.csv",
+        mime="text/csv",
+        key="download_summary_overview",
+    )
 
     # Table 2: Volume by customer
     if "customer" in df_f.columns:
@@ -999,6 +1118,14 @@ def render_supply_chain_analytics():
             .sort_values("Total_Units", ascending=False)
         )
         st.dataframe(tbl_customer, use_container_width=True)
+        csv_cust = tbl_customer.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "下載客戶統計 CSV" if st.session_state.get("lang", "zh") == "zh" else "Download customer summary CSV",
+            data=csv_cust,
+            file_name="customer_summary.csv",
+            mime="text/csv",
+            key="download_customer_summary",
+        )
 
     # Table 3: Device / Model performance
     if "ModelNum" in df_f.columns and "DeviceName" in df_f.columns:
@@ -1013,6 +1140,14 @@ def render_supply_chain_analytics():
             .sort_values("Total_Units", ascending=False)
         )
         st.dataframe(tbl_device, use_container_width=True)
+        csv_dev = tbl_device.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "下載裝置/型號統計 CSV" if st.session_state.get("lang", "zh") == "zh" else "Download device/model summary CSV",
+            data=csv_dev,
+            file_name="device_model_summary.csv",
+            mime="text/csv",
+            key="download_device_summary",
+        )
 
     # ========== 5 DISTRIBUTION / RELATION CHARTS ==========
     st.markdown(tr("dist_charts"))
@@ -1024,8 +1159,10 @@ def render_supply_chain_analytics():
         time_agg = (
             df_f[df_f["deliverdate_dt"].notna()]
             .groupby("deliverdate_dt")
-            .agg(Total_Units=("Numbers", "sum") if "Numbers" in df_f.columns else ("deliverdate_dt", "count"),
-                 Lines=("Suppliername", "count") if "Suppliername" in df_f.columns else ("deliverdate_dt", "count"))
+            .agg(
+                Total_Units=("Numbers", "sum") if "Numbers" in df_f.columns else ("deliverdate_dt", "count"),
+                Lines=("Suppliername", "count") if "Suppliername" in df_f.columns else ("deliverdate_dt", "count"),
+            )
             .reset_index()
             .sort_values("deliverdate_dt")
         )
@@ -1087,11 +1224,62 @@ def render_supply_chain_analytics():
         )
         st.plotly_chart(fig_lic, use_container_width=True)
 
-    # Chart 5: Supply chain relation graph
+    # Chart 5: Supply chain relation graph with filters & controls
     st.markdown("#### Supply Chain Relation Graph (Supplier → Device → Customer)")
-    net = build_supply_chain_graph(df_f)
-    render_supply_chain_graph(net)
-###
+
+    col_g1, col_g2, col_g3 = st.columns([1.5, 1.5, 2])
+
+    with col_g1:
+        if "licenseID" in df_f.columns:
+            lic_values = sorted(df_f["licenseID"].dropna().unique().tolist())
+            lic_options = ["All"] + lic_values
+            selected_license = st.selectbox("Filter by LicenseID", options=lic_options, index=0)
+        else:
+            selected_license = "All"
+
+    with col_g2:
+        if "LotNumber" in df_f.columns:
+            lot_values = sorted(df_f["LotNumber"].dropna().unique().tolist())
+            lot_options = ["All"] + lot_values
+            selected_lot = st.selectbox("Filter by LotNumber", options=lot_options, index=0)
+        else:
+            selected_lot = "All"
+
+    with col_g3:
+        max_nodes = st.number_input("Max nodes", min_value=10, max_value=2000, value=200, step=10)
+        max_edges = st.number_input("Max edges", min_value=10, max_value=4000, value=400, step=10)
+        graph_height = st.slider("Graph height (px)", min_value=300, max_value=900, value=520, step=20)
+
+    search_term = st.text_input("Search node (customer code or device name)")
+
+    # Legend
+    st.markdown(
+        """
+        <div style="margin-bottom:8px;">
+          <strong>Legend:</strong>
+          <span style="display:inline-block;width:12px;height:12px;background:#38bdf8;border-radius:50%;margin:0 4px;"></span>
+          Supplier
+          <span style="display:inline-block;width:12px;height:12px;background:#22c55e;border-radius:50%;margin:0 4px 0 12px;"></span>
+          Device
+          <span style="display:inline-block;width:12px;height:12px;background:#f97316;border-radius:50%;margin:0 4px 0 12px;"></span>
+          Customer
+          <span style="display:inline-block;width:12px;height:12px;background:#facc15;border-radius:50%;margin:0 4px 0 12px;"></span>
+          Search highlight
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    net = build_supply_chain_graph(
+        df_f,
+        license_id_filter=None if selected_license == "All" else selected_license,
+        lot_filter=None if selected_lot == "All" else selected_lot,
+        max_nodes=int(max_nodes),
+        max_edges=int(max_edges),
+        search_term=search_term.strip() or None,
+    )
+    render_supply_chain_graph(net, height=int(graph_height))
+
 
 def load_skill_md():
     if not os.path.exists("SKILL.md"):
@@ -1111,7 +1299,6 @@ def main():
         layout="wide",
     )
 
-    # Initialize core session state
     if "theme" not in st.session_state:
         st.session_state.theme = "light"
     if "lang" not in st.session_state:
@@ -1120,15 +1307,14 @@ def main():
         st.session_state.painter_style_idx = 0
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "usage_log" not in st.session_state:
+        st.session_state.usage_log = []
 
-    # Initialize orchestrator
     if "orchestrator" not in st.session_state:
         st.session_state.orchestrator = AgentOrchestrator()
 
-    # Apply WOW theme
     apply_wow_theme()
 
-    # Header
     st.markdown(f"<div class='main-header'>{tr('app_title')}</div>", unsafe_allow_html=True)
     st.markdown("---")
 
@@ -1159,11 +1345,11 @@ def main():
         with col_style1:
             if st.button(tr("style_jackslot")):
                 st.session_state.painter_style_idx = (st.session_state.painter_style_idx + 1) % len(PAINTER_STYLES)
-                st.experimental_rerun()
+                st.rerun()
         with col_style2:
             if st.button(tr("style_wheel")):
                 st.session_state.painter_style_idx = random.randint(0, len(PAINTER_STYLES) - 1)
-                st.experimental_rerun()
+                st.rerun()
 
         style = current_style()
         style_name = style["name_zh"] if st.session_state.lang == "zh" else style["name_en"]
@@ -1172,7 +1358,6 @@ def main():
         render_api_key_section()
         st.markdown("---")
 
-        # Agent selection (for chat tab)
         st.subheader(tr("select_agent"))
         agent_options = {
             "auto": "🎯 Auto Routing",
@@ -1199,9 +1384,10 @@ def main():
         if st.button(tr("clear_chat"), use_container_width=True):
             st.session_state.messages = []
             orchestrator.conversation_history = []
-            st.experimental_rerun()
+            log_event("chat_cleared", "User cleared conversation")
+            st.rerun()
 
-    # Main content tabs
+    # Tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         [tr("chat_tab"), tr("agents_tab"), tr("analytics_tab"), tr("agent_hq_tab"), tr("docs_tab")]
     )
@@ -1257,9 +1443,11 @@ def main():
                 st.write("**System Prompt:**")
                 st.code(agent.system_prompt, language="text")
 
-    # Analytics dashboard (Agent usage + Supply chain)
+    # Analytics dashboard
     with tab3:
-        subtab_a, subtab_b = st.tabs([tr("agent_usage_stats"), tr("supply_chain_analytics")])
+        subtab_a, subtab_b, subtab_c = st.tabs(
+            [tr("agent_usage_stats"), tr("supply_chain_analytics"), tr("usage_log_tab")]
+        )
 
         with subtab_a:
             if orchestrator.conversation_history:
@@ -1303,7 +1491,15 @@ def main():
         with subtab_b:
             render_supply_chain_analytics()
 
-    # Agent HQ: advanced controls, model/prompt chaining
+        with subtab_c:
+            if st.session_state.usage_log:
+                df_log = pd.DataFrame(st.session_state.usage_log)
+                df_log = df_log.sort_values("timestamp", ascending=False)
+                st.dataframe(df_log, use_container_width=True)
+            else:
+                st.info("No usage log entries yet.")
+
+    # Agent HQ
     with tab4:
         render_agent_headquarters(orchestrator)
 
