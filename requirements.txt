@@ -9,3 +9,7 @@ pypdf
 PyYAML
 altair
 httpx
+plotly
+networkx
+pyvis
+requests
