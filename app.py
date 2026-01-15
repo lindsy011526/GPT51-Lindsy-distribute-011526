@@ -893,8 +893,7 @@ def render_agent_headquarters(orchestrator: AgentOrchestrator):
         if st.button(tr("agent_hq_use_as_next")):
             st.session_state.agent_chain["current_input"] = editable
             st.success("Set as next agent input. Scroll up to adjust agent/model and run again.")
-
-
+###
 def render_supply_chain_analytics():
     st.subheader(tr("supply_chain_analytics"))
     uploaded = st.file_uploader(tr("upload_csv"), type=["csv"])
@@ -907,39 +906,81 @@ def render_supply_chain_analytics():
     # Basic filters
     st.markdown("### Filters")
     col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        customers = sorted(df["customer"].dropna().unique().tolist()) if "customer" in df.columns else []
-        selected_customers = st.multiselect("Customer", options=customers, default=customers)
-    with col_f2:
-        if "deliverdate_dt" in df.columns and df["deliverdate_dt"].notna().any():
-            min_d = df["deliverdate_dt"].min()
-            max_d = df["deliverdate_dt"].max()
-            date_range = st.slider("Deliver Date Range", min_value=min_d, max_value=max_d, value=(min_d, max_d))
-        else:
-            date_range = None
 
-    mask = pd.Series([True] * len(df))
+    # ---- Customer filter ----
+    with col_f1:
+        if "customer" in df.columns:
+            customers = sorted(df["customer"].dropna().unique().tolist())
+            selected_customers = st.multiselect("Customer", options=customers, default=customers)
+        else:
+            customers = []
+            selected_customers = []
+
+    # ---- Date range filter: use Python datetime.date to avoid Streamlit type issues ----
+    with col_f2:
+        date_range = None
+        if "deliverdate_dt" in df.columns and df["deliverdate_dt"].notna().any():
+            # 僅使用非 NaT 的列來計算範圍
+            df_dates = df[df["deliverdate_dt"].notna()].copy()
+
+            # 轉成 Python datetime.date，避免 pandas.Timestamp / NaT 型別混用
+            min_ts = df_dates["deliverdate_dt"].min()
+            max_ts = df_dates["deliverdate_dt"].max()
+
+            # 保險起見先確定是 Timestamp 或 datetime，再取 .date()
+            if isinstance(min_ts, pd.Timestamp):
+                min_d = min_ts.date()
+            else:
+                min_d = min_ts
+
+            if isinstance(max_ts, pd.Timestamp):
+                max_d = max_ts.date()
+            else:
+                max_d = max_ts
+
+            # Slider 完全使用 datetime.date 型別
+            date_range = st.slider(
+                "Deliver Date Range",
+                min_value=min_d,
+                max_value=max_d,
+                value=(min_d, max_d),
+            )
+
+    # ---- Apply filters to DataFrame ----
+    # 初始全部 True
+    mask = pd.Series(True, index=df.index)
+
     if selected_customers:
         mask &= df["customer"].isin(selected_customers)
-    if date_range:
-        mask &= df["deliverdate_dt"].between(date_range[0], date_range[1])
+
+    if date_range and "deliverdate_dt" in df.columns:
+        # slider 回傳的是 datetime.date，將欄位轉為 date 後再 between
+        start_date, end_date = date_range
+        valid_dt = df["deliverdate_dt"].notna()
+        mask &= valid_dt
+        mask.loc[valid_dt] &= df.loc[valid_dt, "deliverdate_dt"].dt.date.between(start_date, end_date)
+
     df_f = df[mask].copy()
 
     # ========== 3 SUMMARY TABLES ==========
     st.markdown(tr("summary_tables"))
 
     # Table 1: Global metrics
-    total_units = int(df_f["Numbers"].sum()) if "Numbers" in df_f.columns else len(df_f)
+    if "Numbers" in df_f.columns:
+        total_units = int(df_f["Numbers"].sum())
+    else:
+        total_units = len(df_f)
+
     summary_1 = pd.DataFrame(
         [
             {
                 "Total Lines": len(df_f),
                 "Total Units": total_units,
-                "Suppliers": df_f["Suppliername"].nunique(),
-                "Customers": df_f["customer"].nunique(),
-                "Devices": df_f["DeviceName"].nunique(),
-                "Models": df_f["ModelNum"].nunique(),
-                "Lots": df_f["LotNumber"].nunique(),
+                "Suppliers": df_f["Suppliername"].nunique() if "Suppliername" in df_f.columns else 0,
+                "Customers": df_f["customer"].nunique() if "customer" in df_f.columns else 0,
+                "Devices": df_f["DeviceName"].nunique() if "DeviceName" in df_f.columns else 0,
+                "Models": df_f["ModelNum"].nunique() if "ModelNum" in df_f.columns else 0,
+                "Lots": df_f["LotNumber"].nunique() if "LotNumber" in df_f.columns else 0,
             }
         ]
     )
@@ -950,9 +991,9 @@ def render_supply_chain_analytics():
         tbl_customer = (
             df_f.groupby("customer")
             .agg(
-                Total_Units=("Numbers", "sum"),
+                Total_Units=("Numbers", "sum") if "Numbers" in df_f.columns else ("customer", "count"),
                 Lines=("customer", "count"),
-                Unique_Models=("ModelNum", "nunique"),
+                Unique_Models=("ModelNum", "nunique") if "ModelNum" in df_f.columns else ("customer", "nunique"),
             )
             .reset_index()
             .sort_values("Total_Units", ascending=False)
@@ -960,13 +1001,13 @@ def render_supply_chain_analytics():
         st.dataframe(tbl_customer, use_container_width=True)
 
     # Table 3: Device / Model performance
-    if "ModelNum" in df_f.columns:
+    if "ModelNum" in df_f.columns and "DeviceName" in df_f.columns:
         tbl_device = (
             df_f.groupby(["DeviceName", "ModelNum"])
             .agg(
-                Total_Units=("Numbers", "sum"),
-                Customers=("customer", "nunique"),
-                Lots=("LotNumber", "nunique"),
+                Total_Units=("Numbers", "sum") if "Numbers" in df_f.columns else ("ModelNum", "count"),
+                Customers=("customer", "nunique") if "customer" in df_f.columns else ("ModelNum", "nunique"),
+                Lots=("LotNumber", "nunique") if "LotNumber" in df_f.columns else ("ModelNum", "nunique"),
             )
             .reset_index()
             .sort_values("Total_Units", ascending=False)
@@ -981,8 +1022,10 @@ def render_supply_chain_analytics():
     # Chart 1: Deliveries over time
     if "deliverdate_dt" in df_f.columns and df_f["deliverdate_dt"].notna().any():
         time_agg = (
-            df_f.groupby("deliverdate_dt")
-            .agg(Total_Units=("Numbers", "sum"), Lines=("Suppliername", "count"))
+            df_f[df_f["deliverdate_dt"].notna()]
+            .groupby("deliverdate_dt")
+            .agg(Total_Units=("Numbers", "sum") if "Numbers" in df_f.columns else ("deliverdate_dt", "count"),
+                 Lines=("Suppliername", "count") if "Suppliername" in df_f.columns else ("deliverdate_dt", "count"))
             .reset_index()
             .sort_values("deliverdate_dt")
         )
@@ -999,7 +1042,7 @@ def render_supply_chain_analytics():
     if "customer" in df_f.columns:
         cust_agg = (
             df_f.groupby("customer")
-            .agg(Total_Units=("Numbers", "sum"))
+            .agg(Total_Units=("Numbers", "sum") if "Numbers" in df_f.columns else ("customer", "count"))
             .reset_index()
             .sort_values("Total_Units", ascending=False)
         )
@@ -1015,7 +1058,7 @@ def render_supply_chain_analytics():
     if "DeviceName" in df_f.columns:
         dev_agg = (
             df_f.groupby("DeviceName")
-            .agg(Total_Units=("Numbers", "sum"))
+            .agg(Total_Units=("Numbers", "sum") if "Numbers" in df_f.columns else ("DeviceName", "count"))
             .reset_index()
             .sort_values("Total_Units", ascending=False)
             .head(10)
@@ -1028,11 +1071,11 @@ def render_supply_chain_analytics():
         )
         st.plotly_chart(fig_dev, use_container_width=True)
 
-    # Chart 4: Volume by LicenseID / DeviceCategory (pie or bar)
+    # Chart 4: Volume by LicenseID / DeviceCategory (pie)
     if "licenseID" in df_f.columns:
         lic_agg = (
             df_f.groupby("licenseID")
-            .agg(Total_Units=("Numbers", "sum"))
+            .agg(Total_Units=("Numbers", "sum") if "Numbers" in df_f.columns else ("licenseID", "count"))
             .reset_index()
             .sort_values("Total_Units", ascending=False)
         )
@@ -1048,7 +1091,7 @@ def render_supply_chain_analytics():
     st.markdown("#### Supply Chain Relation Graph (Supplier → Device → Customer)")
     net = build_supply_chain_graph(df_f)
     render_supply_chain_graph(net)
-
+###
 
 def load_skill_md():
     if not os.path.exists("SKILL.md"):
